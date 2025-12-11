@@ -40,7 +40,6 @@ from awesome_align.tokenization_utils import PreTrainedTokenizer
 from awesome_align.modeling_utils import PreTrainedModel
 
 
-
 logger = logging.getLogger(__name__)
 
 import itertools
@@ -293,6 +292,31 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
+    # -----------------------------------------------------------
+    # Restore optimizer, scheduler, and global_step
+    # -----------------------------------------------------------
+    if args.should_continue:
+
+        checkpoint_dir = args.model_name_or_path
+        opt_path = os.path.join(checkpoint_dir, "optimizer.pt")
+        sch_path = os.path.join(checkpoint_dir, "scheduler.pt")
+        step_path = os.path.join(checkpoint_dir, "global_step.pt")
+        if os.path.isfile(opt_path):
+            print(f"[Resume] Loading optimizer state from {opt_path}")
+            resume_optimizer_state = torch.load(opt_path, map_location=args.device)
+            optimizer.load_state_dict(resume_optimizer_state)
+        if os.path.isfile(sch_path):
+            print(f"[Resume] Loading scheduler state from {sch_path}")
+            resume_scheduler_state = torch.load(sch_path, map_location=args.device)
+            scheduler.load_state_dict(resume_scheduler_state)
+        if os.path.isfile(step_path):
+            print(f"[Resume] Loading training step from {step_path}")
+            global_step = torch.load(step_path)
+            print(f"Resuming from global_step = {global_step}")
+        else:
+            global_step = 0
+    else:
+        global_step = 0
 
     if args.fp16:
         try:
@@ -325,7 +349,6 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
-    global_step = 0
     # Check if continuing training from a checkpoint
     tr_loss, logging_loss = 0.0, 0.0
 
@@ -348,8 +371,9 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
         else:
             loss.backward()
         return tot_loss
-
-    tqdm_iterator = trange(int(t_total), desc="Iteration", disable=args.local_rank not in [-1, 0])
+    t_total = int(t_total)
+    global_step = int(global_step)
+    tqdm_iterator = trange(global_step, t_total, desc="Iteration", disable=args.local_rank not in [-1, 0])
     for _ in range(int(args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
             model.train()
@@ -418,12 +442,41 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
 
                     torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     logger.info("Saving model checkpoint to %s", output_dir)
+                    logger.info(f"Evaluating checkpoint {output_dir}")
+                    eval_result = evaluate(args, model.module, tokenizer, prefix=f"checkpoint-{global_step}")
+                    current_loss = float(eval_result["perplexity"])
+                    metrics_file = os.path.join(args.output_dir, "checkpoint_scores.txt")
 
-                    _rotate_checkpoints(args, checkpoint_prefix)
+                    # _rotate_checkpoints(args, checkpoint_prefix)
 
                     torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                    torch.save(global_step, os.path.join(output_dir, "global_step.pt"))
                     logger.info("Saving optimizer and scheduler states to %s", output_dir)
+
+                    with open(metrics_file, "a") as f:
+                        f.write(f"{global_step}\t{current_loss}\n")
+                    all_scores = []
+                    with open(metrics_file, "r") as f:
+                        for line in f:
+                            step, loss = line.strip().split()
+                            all_scores.append((int(step), float(loss)))
+                    all_scores.sort(key=lambda x: x[1]) 
+                    keep_scores = all_scores[: args.save_best_k]
+                    keep_steps = set(x[0] for x in keep_scores)
+
+                    # ---------------------------
+                    # Delete other checkpoints
+                    # ---------------------------
+                    for step, loss in all_scores:
+                        if step not in keep_steps:
+                            bad_ckpt = os.path.join(args.output_dir, f"checkpoint-{step}")
+                            if os.path.isdir(bad_ckpt):
+                                logger.info(f"Removing worse checkpoint: {bad_ckpt}")
+                                import shutil
+                                shutil.rmtree(bad_ckpt)
+
+                    logger.info(f"Top-{args.save_best_k} checkpoints: {keep_steps}")
 
             if global_step > t_total:
                 break
@@ -444,6 +497,9 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
     def collate(examples):
+
+        def unwrap(model):
+            return model.module if hasattr(model, "module") else model
         model.eval()
         examples_src, examples_tgt, examples_srctgt, examples_tgtsrc, langid_srctgt, langid_tgtsrc, psi_examples_srctgt, psi_labels = [], [], [], [], [], [], [], []
         src_len = tgt_len = 0
@@ -507,11 +563,22 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
         psi_labels = torch.tensor(psi_labels)
         if word_aligns[0] is None:
             word_aligns = None
-        if args.n_gpu > 1 or args.local_rank != -1:
-            guides = model.module.get_aligned_word(examples_src, examples_tgt, bpe2word_map_src, bpe2word_map_tgt, args.device, src_len, tgt_len, align_layer=args.align_layer, extraction=args.extraction, softmax_threshold=args.softmax_threshold, word_aligns=word_aligns)
-        else:
-            guides = model.get_aligned_word(examples_src, examples_tgt, bpe2word_map_src, bpe2word_map_tgt, args.device, src_len, tgt_len, align_layer=args.align_layer, extraction=args.extraction, softmax_threshold=args.softmax_threshold, word_aligns=word_aligns)
-
+        # if args.n_gpu > 1 or args.local_rank != -1:
+        #     guides = model.module.get_aligned_word(examples_src, examples_tgt, bpe2word_map_src, bpe2word_map_tgt, args.device, src_len, tgt_len, align_layer=args.align_layer, extraction=args.extraction, softmax_threshold=args.softmax_threshold, word_aligns=word_aligns)
+        # else:
+        #     guides = model.get_aligned_word(examples_src, examples_tgt, bpe2word_map_src, bpe2word_map_tgt, args.device, src_len, tgt_len, align_layer=args.align_layer, extraction=args.extraction, softmax_threshold=args.softmax_threshold, word_aligns=word_aligns)
+        core = model
+        while hasattr(core, "module"):
+            core = core.module
+        guides = core.get_aligned_word(
+            examples_src, examples_tgt,
+            bpe2word_map_src, bpe2word_map_tgt,
+            args.device, src_len, tgt_len,
+            align_layer=args.align_layer,
+            extraction=args.extraction,
+            softmax_threshold=args.softmax_threshold,
+            word_aligns=word_aligns
+        )
         return examples_src, examples_tgt, guides, examples_srctgt, langid_srctgt, examples_tgtsrc, langid_tgtsrc, psi_examples_srctgt, psi_labels
 
     eval_sampler = SequentialSampler(eval_dataset)
@@ -678,7 +745,7 @@ def main():
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
     parser.add_argument("--per_gpu_train_batch_size", default=2, type=int, help="Batch size per GPU/CPU for training.")
     parser.add_argument(
-        "--per_gpu_eval_batch_size", default=2, type=int, help="Batch size per GPU/CPU for evaluation."
+        "--per_gpu_eval_batch_size", default=32, type=int, help="Batch size per GPU/CPU for evaluation."
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -730,6 +797,10 @@ def main():
         "See details at https://nvidia.github.io/apex/amp.html",
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+                    "--save_best_k", type=int, default=3,
+                    help="Keep top-K checkpoints based on validation loss."
+                    )
     args = parser.parse_args()
 
     if args.eval_data_file is None and args.do_eval:
