@@ -269,8 +269,15 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
 
 
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+
+    # train_sampler = DistributedSampler(
+    #                                         train_dataset,
+    #                                         num_replicas=1 if args.local_rank == -1 else torch.distributed.get_world_size(),
+    #                                         rank=0 if args.local_rank == -1 else args.local_rank,
+    #                                         shuffle=True,
+    #                                     )
     train_dataloader = DataLoader(
-        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, collate_fn=collate
+        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, collate_fn=collate, pin_memory=True,
     )
 
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
@@ -318,6 +325,30 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     else:
         global_step = 0
 
+    # -----------------------------------------------------------
+    # Restore dataloader position
+    # -----------------------------------------------------------
+
+    start_epoch = 0
+    start_step = 0
+    if args.should_continue:
+        epoch_path = os.path.join(checkpoint_dir, "epoch.pt")
+        step_in_epoch_path = os.path.join(checkpoint_dir, "step_in_epoch.pt")
+        rng_path = os.path.join(checkpoint_dir, "rng.pt")
+
+        if os.path.isfile(epoch_path):
+            start_epoch = torch.load(epoch_path)
+
+        if os.path.isfile(step_in_epoch_path):
+            start_step = torch.load(step_in_epoch_path)
+        if os.path.isfile(rng_path):
+            print(f"[Resume] Loading rng from {rng_path}")
+            rng = torch.load(rng_path, weights_only=False)
+            torch.set_rng_state(rng["torch"])
+            torch.cuda.set_rng_state_all(rng["cuda"])
+            random.setstate(rng["random"])
+            np.random.set_state(rng["numpy"])
+
     if args.fp16:
         try:
             from apex import amp
@@ -356,7 +387,8 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     model_to_resize.resize_token_embeddings(len(tokenizer))
 
     model.zero_grad()
-    set_seed(args)  # Added here for reproducibility
+    if not args.should_continue:
+        set_seed(args)  # Added here for reproducibility
 
     def backward_loss(loss, tot_loss):
         if args.n_gpu > 1:
@@ -374,8 +406,15 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     t_total = int(t_total)
     global_step = int(global_step)
     tqdm_iterator = trange(global_step, t_total, desc="Iteration", disable=args.local_rank not in [-1, 0])
-    for _ in range(int(args.num_train_epochs)):
+    # for _ in range(int(args.num_train_epochs)):
+    for epoch in range(start_epoch, int(args.num_train_epochs)):
+
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
         for step, batch in enumerate(train_dataloader):
+            if epoch == start_epoch and step < start_step:
+                print(f"epoch {epoch} skipping step {step}")
+                continue
             model.train()
 
             if args.train_so or args.train_co:
@@ -430,10 +469,13 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                     logging_loss = tr_loss
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                    
                     checkpoint_prefix = "checkpoint"
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, "{}-{}".format(checkpoint_prefix, global_step))
+                    
                     os.makedirs(output_dir, exist_ok=True)
+                    logger.info("Saving optimizer and scheduler states to %s", output_dir)
                     model_to_save = (
                         model.module if hasattr(model, "module") else model
                     )  # Take care of distributed/parallel training
@@ -452,7 +494,17 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                     torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                     torch.save(global_step, os.path.join(output_dir, "global_step.pt"))
-                    logger.info("Saving optimizer and scheduler states to %s", output_dir)
+                    torch.save(epoch, os.path.join(output_dir, "epoch.pt"))
+                    torch.save(step + 1, os.path.join(output_dir, "step_in_epoch.pt"))
+
+                    torch.save({
+                        "torch": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state_all(),
+                        "random": random.getstate(),
+                        "numpy": np.random.get_state(),
+                    }, os.path.join(output_dir, "rng.pt"))
+
+                    
 
                     with open(metrics_file, "a") as f:
                         f.write(f"{global_step}\t{current_loss}\n")
@@ -482,7 +534,7 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 break
         if global_step > t_total:
             break
-
+        start_step = 0
     return global_step, tr_loss / global_step
 
 def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefix="") -> Dict:
@@ -854,7 +906,8 @@ def main():
     )
 
     # Set seed
-    set_seed(args)
+    if not args.should_continue:
+        set_seed(args)
 
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
